@@ -2,6 +2,8 @@
 const sha256 = require("sha256");
 const axios = require("axios");
 const key_gen = require("./keygen");
+const Cart = require("../models/cartModel");
+
 
 /**
  * Creates a new instance of the PhonePe integration.
@@ -12,25 +14,36 @@ const key_gen = require("./keygen");
  * @param {string} PHONEPE_CALLBACK_URL - The callback URL where PhonePe will send transaction notifications.
  * @param {string} PHONEPE_KEY - The secret key used for secure communication with PhonePe APIs.
  */
-class PhonePe {
-  constructor(PHONEPE_MERCHANT_ID, PHONEPE_MERCHANT_USER_ID, PHONEPE_CALLBACK_URL, PHONEPE_KEY, fetchUserCartFunction) {
-    this.merchant_id ="PGTESTPAYUAT";
-    this.merchant_user_id = PHONEPE_MERCHANT_USER_ID;
-    this.phonepe_callback_url = "https://www.immortals.org.in/api/user/onlinepayment";
-    this.phonepe_key =	"099eb0cd-02cf-4e2a-8aca-3e6c6aff0399";
-    this.fetchUserCart = fetchUserCartFunction;
 
-    
+
+
+class PhonePe {
+  constructor() {
+    this.merchant_id ="IMMORTALSONLINE";
+    // this.merchant_user_id = "MUID123";
+    this.phonepe_callback_url = "https://www.immortals.org.in/functions/prepaidordersuccesfull.html";
+    this.phonepe_key = "92a0803e-6cc4-4531-84cc-1736ced40ad2";
+    // this.fetchUserCart = fetchUserCartFunction;
   }
 
   /**
    * Asynchronously generates a transaction ID and sets it to the instance.
-   *
+  *
    * @async
    * @function
    * @param {string} tnxId - Optional. An existing transaction ID to be used. If not provided, a new transaction ID will be generated.
    * @returns {Promise<string>} The generated or existing transaction ID.
    */
+
+
+async fetchUserCart(userId) {
+  try {
+    const cart = await Cart.findOne({ orderby: userId }).populate("products.product");
+    return cart; // Returns the cart object
+  } catch (error) {
+    throw new Error(error);
+  }
+};
 
   async createTxn(tnxId) {
     this.tnxId = await key_gen();
@@ -60,7 +73,7 @@ class PhonePe {
    * @returns {Promise<object>} An object containing the generated transaction details.
    */
 
-  async generate(data, userId) {
+  async generate(data, userId,finalAmount) {
     if (!this.tnxId) {
       await this.createTxn();
     }
@@ -71,17 +84,23 @@ class PhonePe {
       return Error("Amount is required in payload");
     }
 
+ 
+
       // Fetch the mobile number from the cart's address
-  const mobileNumber = cart.address?.mobile;
+      const mobileNumber = cart.address && cart.address.length > 0 ? cart.address[0].mobile : undefined;
+
+      console.log(userId);
      
+      await Cart.updateOne({ orderby: userId }, { transactionId: this.tnxId });
+
     let PAYLOAD = {
       merchantId: this.merchant_id,
-      merchantUserId: this.merchant_user_id,
-      amount: cart.cartTotal, // Use the cart total as the amount
+      merchantUserId:userId,
+      amount: finalAmount, // Use the cart total as the amount
       merchantTransactionId: this.tnxId,
       callbackUrl: this.phonepe_callback_url,
-      redirectUrl: "https://www.immortals.org.in/functions/orderpage.html",
-      redirectMode: "POST",
+      redirectUrl: "https://www.immortals.org.in/functions/prepaidordersuccesfull.html",
+      redirectMode: "GET",
       mobileNumber:mobileNumber,
       paymentInstrument: {
         type: "PAY_PAGE",
@@ -129,15 +148,30 @@ class PhonePe {
    * @returns {Promise<object>} An object containing the transaction status details.
    */
     async checkStatus(merchantId, merchantTransactionId) {
-      const url = `https://api.phonepe.com/apis/hermes/pg/v1/status/${merchantId}/${merchantTransactionId}`;
-      try {
-        const response = await axios.get(url);
-        return response.data;
-      } catch (error) {
-        console.trace(`Request Failed to check status with error: ${error}`);
-        throw error; // Re-throw the error so the calling code can handle it
-      }
-    }
+      const options = {
+       method: 'GET',
+       url: `https://api.phonepe.com/apis/hermes/pg/v1/status/${merchantId}/${merchantTransactionId}`,
+       headers: {
+       accept: 'application/json',
+       'Content-Type': 'application/json',
+       'X-VERIFY': checksum,
+       'X-MERCHANT-ID': `${merchantId}`
+       }
+       };
+      // CHECK PAYMENT STATUS
+       axios.request(options).then(async(response) => {
+       if (response.data.success === true) {
+       console.log(response.data)
+       return res.status(200).send({success: true, message:"Payment Success"});
+       } else {
+       return res.status(400).send({success: false, message:"Payment Failure"});
+       }
+       })
+       .catch((err) => {
+       console.error(err);
+       res.status(500).send({msg: err.message});
+       });
+      };
 }
 
-module.exports = PhonePe;
+module.exports = {PhonePe};
