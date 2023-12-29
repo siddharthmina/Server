@@ -5,7 +5,7 @@ const Coupon = require("../models/couponModel");
 const Order = require("../models/orderModel");
 const uniqid = require("uniqid");
 
-const PhonePe = require('../config/phonepe');
+const { PhonePe} = require('../config/phonepe');
 
 const asyncHandler = require("express-async-handler");
 const { generateToken } = require("../config/jwtToken");
@@ -14,6 +14,65 @@ const { generateRefreshToken } = require("../config/refreshtoken");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 // const sendEmail = require("./emailCtrl");
+
+const phonepedata = asyncHandler(async (req, res) => {
+  try {
+    // Initialize PhonePe class
+    const phonePe = new PhonePe();
+
+    // Step 1: Extract data from PhonePe's POST request
+    const {
+      merchantId,
+      merchantTransactionId,
+      amount,
+      // ... (other fields as per PhonePe's response)
+    } = req.body;
+
+    // Step 2: Validate data (ensure necessary fields are present)
+    if (!merchantId || !merchantTransactionId || !amount) {
+      res.status(400).send('Bad Request: Missing necessary fields');
+      return;
+    }
+
+    // Step 3: Find the corresponding cart using merchantTransactionId
+    const cart = await Cart.findOne({ transactionId: merchantTransactionId });
+    if (!cart) {
+      res.status(404).send('Cart not found');
+      return;
+    }
+
+    // Step 4: Find the user associated with the cart
+    const user = await User.findById(cart.orderby);
+    if (!user) {
+      res.status(404).send('User not found');
+      return;
+    }
+
+    // Step 5: Set the req.user object to contain the user's ID, 
+    // so the createPrepaidOrder function can use it
+    req.user = { _id: user._id };
+
+    // Step 6: Check payment status with PhonePe
+    const paymentStatusResponse = await phonePe.checkStatus(merchantId, merchantTransactionId);
+    
+    if (paymentStatusResponse.status === 'SUCCESS') {
+      // Payment was successful, create a new order
+      createPrepaidOrder(req, res);
+      
+      // Redirect to a success page
+      res.redirect('https://www.immortals.org.in/payment-success');
+    } else {
+      // Payment failed, do not create a new order
+      
+      // Redirect to a failure page
+      res.redirect('https://www.immortals.org.in/payment-failure');
+    }
+  } catch (error) {
+    console.error('Error handling PhonePe data:', error);
+    res.status(500).send('Internal Server Error');
+  }
+});
+
 
 const onlinepayment = asyncHandler(async (req, res) => {
   // Retrieve and validate user ID
@@ -28,11 +87,14 @@ const onlinepayment = asyncHandler(async (req, res) => {
     throw new Error("No cart found for the user");
   }
 
+    // Access the finalAmount stored in res.locals
+    const finalAmount = res.locals.finalAmount;
   // Prepare the payment payload
   // Since the generate method in the PhonePe class already handles the details, we just need to provide userId
   try {
+    const phonepe = new PhonePe();
     // Generate the PhonePe payment URL
-    const paymentURL = await phonepe.generate({}, _id); // Passing the user ID to the generate method
+    const paymentURL = await phonepe.generate({},_id,finalAmount) // Passing the user ID to the generate method
 
     // You can then redirect the user to the paymentURL or send it as part of the response
     res.json({ paymentURL });
@@ -619,7 +681,7 @@ const applyCoupon = asyncHandler(async (req, res) => {
 
   // Check minimum cart total
   if (cartTotal < validCoupon.minCartTotal) {
-    throw new Error(`Coupon is applicable only for cart total of at least $${validCoupon.minCartTotal}`);
+    throw new Error(`Coupon is applicable only for cart total of at least ₹${validCoupon.minCartTotal}`);
   }
 
   // Calculate total product count considering the count of each product
@@ -637,12 +699,20 @@ if (validCoupon.productCategories && validCoupon.productCategories.length > 0) {
   if (!products.some(product => applicableCategories.has(product.product.category))) {
     throw new Error(`Coupon is not applicable to the product categories in the cart`);
   }
+  let finalAmount = 0;
+  if (couponApplied && userCart.totalAfterDiscount) {
+    finalAmount = userCart.totalAfterDiscount;
+  } else {
+    finalAmount = userCart.cartTotal;
+  }
+
 }
 
   // Calculate the total after discount
   let totalAfterDiscount = (cartTotal - (cartTotal * validCoupon.discount) / 100).toFixed(2);
   await Cart.findOneAndUpdate({ orderby: user._id }, { totalAfterDiscount }, { new: true });
-  res.json(totalAfterDiscount);
+  // res.json(totalAfterDiscount);
+  res.json(finalAmount);
 });
 
 
@@ -702,6 +772,69 @@ const createOrder = asyncHandler(async (req, res) => {
   }
 });
 
+
+const createPrepaidOrder = asyncHandler(async (req, res) => {
+  
+  const { _id } = req.user;
+  validateMongoDbId(_id);
+  // Define the PREPAID variable within your function
+  const PREPAID = true;
+
+  try {
+    const user = await User.findById(_id);
+    let userCart = await Cart.findOne({ orderby: user._id });
+
+    if (!userCart) throw new Error("Cart not found");
+
+    // Retrieve the couponApplied value from the cart
+    const couponApplied = userCart.couponApplied;
+
+    if (!PREPAID) throw new Error("Create Prepaid order failed");
+
+
+    // Retrieve the address from the user's cart
+    const address = userCart ? userCart.address : null;
+    if (!address) throw new Error("Address information not found in the cart");
+
+    let finalAmount = 0;
+    if (couponApplied && userCart.totalAfterDiscount) {
+      finalAmount = userCart.totalAfterDiscount;
+    } else {
+      finalAmount = userCart.cartTotal;
+    }
+  
+    const order = new Order({
+      products: userCart.products,
+      paymentIntent: {
+        id: uniqid(),
+        method: "PREPAID",
+        amount: finalAmount,
+        status: "PREPAID",
+        created: Date.now(),
+        currency: "rupees",
+      },
+      address: address, // Using the address retrieved from the cart
+      orderby: user._id,
+      orderStatus: "PREPAID",
+    });
+    
+    await order.save(); // Save the order to the database
+
+    let update = userCart.products.map((item) => {
+      return {
+        updateOne: {
+          filter: { _id: item.product._id },
+          update: { $inc: { quantity: -item.count, sold: +item.count } },
+        },
+      };
+    });
+
+    const updated = await Product.bulkWrite(update, {});
+    res.json({ message: "success" });
+  } catch (error) {
+    throw new Error(error);
+  }
+});
 
 
 
@@ -769,6 +902,7 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  phonepedata,
   createUser,
   createUserAsGuest,
   loginUserCtrl,
@@ -794,6 +928,7 @@ module.exports = {
   removeCartItem,
   applyCoupon,
   createOrder,
+  createPrepaidOrder,
   onlinepayment,
   getOrders,
   updateOrderStatus,
